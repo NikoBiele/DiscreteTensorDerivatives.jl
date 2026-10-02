@@ -1,47 +1,55 @@
-function gradient(center::Vector{T}, centerval::T,
-                    points::Matrix{T}, pointvals::Vector{T},
-                    idxs::Vector{S}, coeffs::Vector{T}) where {T <: AbstractFloat, S <: Integer}
+"""
+    gradient(stencils::StencilSet, values::AbstractArray) -> Array
+    gradient(stencils::StencilSet, values::AbstractArray, i::Integer) -> Array
 
-    # Gradient estimate for scalar point values
-    dx = points[:,idxs] .- center # coordinate diffs from central node
-    dy = pointvals[idxs] .- centerval # value diffs from central node
-    grad = dx * (coeffs .*dy) # Estimated gradient (tensor product (matrix multiplication))
+Estimate the gradient `∇⊗Y = Σ_k a_k Δx_k ⊗ ΔY_k` of a scalar, vector or
+tensor field `Y` sampled at the stencil points.
 
-    return grad
-end # validated
+`values` holds one field value per point along its last dimension, so it is
+a length-`P` vector for a scalar field, an `n × P` matrix for a vector
+field, an `n × m × P` array for a matrix field, and so on.
 
-function gradient(center::Vector{T}, centerval::Vector{T},
-                    points::Matrix{T}, pointvals::Matrix{T},
-                    idxs::Vector{S}, coeffs::Vector{T}) where {T <: AbstractFloat, S <: Integer}
+The result puts the derivative index first and the point index last. For a
+field with values of size `(dims...)`, it has size `(N, dims..., P)`, with
+`result[a, j..., p] = ∂Y_j/∂x_a` at point `p`. For a vector field this is
+the transpose of the usual Jacobian. The three-argument method returns the
+gradient at point `i` alone, with size `(N, dims...)`.
 
-    # Gradient estimate for vector values (for gradient of gradients, the result is the Hessian)
-    dx = points[:,idxs] .- center # coordinate diffs from central node
-    dy = pointvals[:,idxs] .- centerval # value diffs from central node
-    grad = sum([coeffs[q] * (dx[:,q] * dy[:,q]') for q = 1:length(idxs)]) # gradient estimate (tensor product)
-
-    return grad
-end # validated
-
-function gradient(center::Vector{T}, centerval::Matrix{T},
-                    points::Matrix{T}, pointvals::Vector{Matrix{T}},
-                    idxs::Vector{S}, coeffs::Vector{T}) where {T <: AbstractFloat, S <: Integer}
-
-    # Gradient estimate for matrix values (for a Hessian matrix the result is the gradient of the Hessian)
-    Ndim = size(points)[1]
-    dx = points[:,idxs] .- center # coordinate diffs from central node
-    dy = [pointvals[q]' - centerval for q in idxs] # value diffs from central node
-    grad = zeros(Ndim,Ndim,Ndim)
-    gradT = zeros(Ndim,Ndim,Ndim)
-    for i = 1:Ndim
-        # take the derivative of each row vector in the matrix
-        grad[:,:,i] = sum([coeffs[q] * (dx[:,q] * dy[q][i,:]') for q = 1:length(idxs)]) # gradient estimate (tensor product)
-        # take the derivative of each column vector in the matrix
-        gradT[:,:,i] = sum([coeffs[q] * (dx[:,q] * dy[q][:,i]') for q = 1:length(idxs)]) # gradient estimate (tensor product)
+The estimate is exact for linear fields with `order = 1` stencils, and also
+for quadratic fields with `order = 2` stencils. For smooth fields, it
+converges at first and second order in the stencil size, respectively.
+"""
+function gradient(stencils::StencilSet, values::AbstractArray{<:Real})
+    N, npoints = size(stencils.points)               # dimension and number of points
+    fieldsize = _fieldsize(values, npoints)          # size of the field value at one point
+    V = reshape(values, :, npoints)                  # one column per point, components flattened
+    R = float(promote_type(eltype(stencils.points), eltype(values)))  # result element type
+    result = Array{R}(undef, N, size(V, 1), npoints)
+    for i in 1:npoints
+        result[:, :, i] = _gradient_flat(stencils, V, i)
     end
-    grad_out = zeros(Ndim,Ndim,Ndim)
-    for i = 1:Ndim
-        grad_out[:,:,i] = (grad[:,:,i] .+ gradT[:,:,i]')./2
-    end
+    return reshape(result, N, fieldsize..., npoints)  # restore the field's own dimensions
+end
 
-    return grad_out
-end # validated
+function gradient(stencils::StencilSet, values::AbstractArray{<:Real}, i::Integer)
+    N, npoints = size(stencils.points)               # dimension and number of points
+    fieldsize = _fieldsize(values, npoints)          # size of the field value at one point
+    V = reshape(values, :, npoints)                  # one column per point, components flattened
+    return reshape(_gradient_flat(stencils, V, i), N, fieldsize...)
+end
+
+# Size of one point's field value, after checking that the last dimension counts the points
+function _fieldsize(values::AbstractArray, npoints::Integer)
+    size(values, ndims(values)) == npoints || throw(DimensionMismatch(
+        "the last dimension of values has length $(size(values, ndims(values))), " *
+        "but there are $npoints points"))
+    return size(values)[1:end-1]
+end
+
+# Σ_k a_k Δx_k ΔY_kᵀ at point i, for flattened field values V (components × points)
+function _gradient_flat(stencils::StencilSet, V::AbstractMatrix, i::Integer)
+    nbrs = stencils.neighbours[i]                         # neighbour indices of point i
+    dX = stencils.points[:, nbrs] .- stencils.points[:, i]  # offsets Δx_k, N × k
+    dY = V[:, nbrs] .- V[:, i]                            # value differences ΔY_k, components × k
+    return dX * (stencils.weights[i] .* transpose(dY))    # N × components
+end

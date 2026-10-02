@@ -1,18 +1,140 @@
-function coefficients(center::Vector{T}, points::Matrix{T},
-    nnearest::S) where {T <: AbstractFloat, S <: Integer}
-    # n = 2
-    # k = 20 # for stability use  k > n*(n+3)/2
-    # Take a point near the center of cube
+"""
+    coefficients(dX::AbstractMatrix{T}, order::Integer = 1) where {T<:AbstractFloat} -> Vector{T}
 
-    # Least-squares recipe for coefficients
-    C = center * ones(1,nnearest) # central node
-    dX = points .- C  # diffs from central node
-    G = dX' * dX
-    F = G .* G
-    v = diag(G)
-    N = pinv(G) * G
-    N = Diagonal(ones(length(N[1,:]))) .- N
-    coeffs =  N * pinv(F*N) * v
+Compute the stencil weights `a` for one central point. `dX` is the `N × M`
+matrix whose columns are the offsets `Δx_k = x_k - x_0` of the `M`
+neighbours from the central point in `N` dimensions.
 
-    return coeffs
+For `order = 1`, the weights satisfy
+
+    Σ_k a_k Δx_k = 0    and    Σ_k a_k Δx_k Δx_kᵀ = I,
+
+which needs `M ≥ N(N+3)/2` neighbours. For `order = 2`, they also satisfy
+
+    Σ_k a_k Δx_k ⊗ Δx_k ⊗ Δx_k = 0,
+
+which removes the leading error of the gradient and the Laplacian and needs
+`M ≥ N(N+3)/2 + N(N+1)(N+2)/6` neighbours. Among all weights satisfying the
+conditions, the returned `a` has minimum norm.
+
+The conditions are linear in `a`, so they are solved directly as one small
+system. This gives the same weights as the original Gram-matrix formulation,
+`a = P ((G ∘ G) P)⁺ diag(G)`, because `G ∘ G` carries exactly the
+information of the second-moment equations. If the neighbours are
+degenerate, for example all coplanar in 3D, conditions that cannot be
+satisfied independently are dropped.
+"""
+function coefficients(dX::AbstractMatrix{T}, order::Integer = 1) where {T<:AbstractFloat}
+    N, M = size(dX)                                  # dimension and number of neighbours
+    a = Vector{T}(undef, M)                          # the weights to return
+    workspace = _Workspace{T}(N, M, order)           # scratch arrays for a single call
+    return coefficients!(a, workspace, dX, order)
+end
+
+# Scratch arrays for computing the weights of one stencil, reusable across
+# stencils with the same dimension, number of neighbours and order
+struct _Workspace{T<:AbstractFloat}
+    At::Matrix{T}   # M × m: one column per moment condition, one row per neighbour
+    b::Vector{T}    # m: right-hand side of the moment conditions
+    y::Vector{T}    # m: solution coefficients in the orthonormalized basis
+end
+
+function _Workspace{T}(N::Integer, M::Integer, order::Integer) where {T<:AbstractFloat}
+    m = minimum_neighbours(N, order)                 # number of moment conditions
+    return _Workspace{T}(Matrix{T}(undef, M, m), Vector{T}(undef, m), Vector{T}(undef, m))
+end
+
+# In-place version of `coefficients`: write the weights into `a`, using the
+# arrays of `workspace` as scratch space, so that nothing is allocated
+function coefficients!(a::AbstractVector{T}, workspace::_Workspace{T},
+                       dX::AbstractMatrix{T}, order::Integer) where {T<:AbstractFloat}
+    order in (1, 2) || throw(ArgumentError("order must be 1 or 2, got $order"))
+    N, M = size(dX)                                  # dimension and number of neighbours
+    (length(a) == M && size(workspace.At) == (M, minimum_neighbours(N, order))) ||
+        throw(DimensionMismatch("weights or workspace do not match $M neighbours in $N dimensions at order $order"))
+    h = maximum(norm, eachcol(dX))                   # stencil radius: the largest offset length
+    h > 0 || throw(ArgumentError("all neighbours coincide with the central point"))
+    _moment_system!(workspace, dX, h, order)         # fill At and b with the moment conditions
+    _minimum_norm_solve!(a, workspace)               # minimum-norm weights for the scaled offsets
+    a ./= h^2                                        # undo the scaling, since Σ a_k Δx_k Δx_kᵀ = I makes a ∝ 1/h²
+    return a
+end
+
+# The moment conditions as a linear system, stored transposed for column access:
+# column r of At holds condition r evaluated at every neighbour, with the
+# offsets scaled by h so that all conditions are of similar size. The conditions
+# are: first moments zero (N columns), second moment the identity (N(N+1)/2
+# columns, one per entry i ≤ j) and, for order 2, third moments zero
+# (N(N+1)(N+2)/6 columns, one per entry i ≤ j ≤ l)
+function _moment_system!(workspace::_Workspace{T}, dX::AbstractMatrix{T},
+                         h::T, order::Integer) where {T<:AbstractFloat}
+    At, b = workspace.At, workspace.b                # the arrays to fill
+    N, M = size(dX)                                  # dimension and number of neighbours
+    fill!(b, zero(T))                                # most conditions have a zero right-hand side
+    r = 0                                            # index of the current condition
+    for i in 1:N                                     # Σ a_k S_ik = 0
+        r += 1
+        for k in 1:M
+            At[k, r] = dX[i, k] / h
+        end
+    end
+    for i in 1:N, j in i:N                           # Σ a_k S_ik S_jk = δ_ij
+        r += 1
+        for k in 1:M
+            At[k, r] = (dX[i, k] / h) * (dX[j, k] / h)
+        end
+        b[r] = i == j ? one(T) : zero(T)
+    end
+    if order == 2
+        for i in 1:N, j in i:N, l in j:N             # Σ a_k S_ik S_jk S_lk = 0
+            r += 1
+            for k in 1:M
+                At[k, r] = (dX[i, k] / h) * (dX[j, k] / h) * (dX[l, k] / h)
+            end
+        end
+    end
+    return nothing
+end
+
+# Minimum-norm solution of Atᵀ a = b, written into a. The columns of At are
+# orthonormalized in place by Gram-Schmidt with two passes (enough for full
+# orthogonality), while the right-hand side is forward-substituted alongside.
+# The solution is then a combination of the orthonormal columns. Conditions
+# that are linearly dependent on earlier ones leave a negligible remainder and
+# are dropped.
+function _minimum_norm_solve!(a::AbstractVector{T}, workspace::_Workspace{T}) where {T<:AbstractFloat}
+    At, b, y = workspace.At, workspace.b, workspace.y  # system and scratch coefficients
+    M, m = size(At)                                  # neighbours and conditions
+    tol = 100 * M * eps(T)                           # relative size below which a condition is dependent
+    for r in 1:m
+        t = b[r]                                     # right-hand side, reduced by earlier conditions
+        original = norm(view(At, :, r))              # size of the condition before orthogonalization
+        for pass in 1:2                              # two passes of Gram-Schmidt
+            for s in 1:r-1
+                c = zero(T)                          # component of column r along column s
+                for k in 1:M
+                    c += At[k, s] * At[k, r]
+                end
+                for k in 1:M
+                    At[k, r] -= c * At[k, s]         # remove that component
+                end
+                t -= c * y[s]                        # and its share of the right-hand side
+            end
+        end
+        remaining = norm(view(At, :, r))             # what is left of the condition
+        if remaining <= tol * original
+            At[:, r] .= zero(T)                      # dependent condition: drop it
+            y[r] = zero(T)
+        else
+            for k in 1:M
+                At[k, r] /= remaining                # normalize the new basis column
+            end
+            y[r] = t / remaining
+        end
+    end
+    fill!(a, zero(T))                                # a = Σ_r y_r q_r over the basis columns
+    for r in 1:m, k in 1:M
+        a[k] += At[k, r] * y[r]
+    end
+    return a
 end

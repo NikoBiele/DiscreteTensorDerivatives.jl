@@ -23,19 +23,21 @@ jobs:
       fail-fast: false
       matrix:
         version:
-          - '1.0'
-          - '1.10'
-          - 'nightly'
+          - '1.10'   # long-term support release, the lowest version in [compat]
+          - '1'      # latest stable release
+          - 'pre'    # latest prerelease, for early warning of breakage
         os:
           - ubuntu-latest
         arch:
           - x64
+    env:
+      JULIA_NUM_THREADS: 2   # exercise the threaded StencilSet path
     steps:
       - uses: actions/checkout@v4
-      - uses: julia-actions/setup-julia@v1
+      - uses: julia-actions/setup-julia@v2
         with:
           version: ${{ matrix.version }}
           arch: ${{ matrix.arch }}
-      - uses: julia-actions/cache@v1
+      - uses: julia-actions/cache@v2
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1

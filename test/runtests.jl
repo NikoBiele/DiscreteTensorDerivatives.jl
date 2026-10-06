@@ -151,7 +151,6 @@ interior(points, margin) = [i for i in axes(points, 2) if all(margin .< points[:
         stencils = StencilSet(points)
         f = vec(sum(points; dims = 1))           # scalar field
         V = 2 .* points                          # vector field, 3 × 200
-        M = repeat(points, 1, 1, 2)              # matrix field with values of size 3 × 2
         M = permutedims(reshape(points, 3, 200, 1) .* reshape([1.0, -1.0], 1, 1, 2), (1, 3, 2))  # 3 × 2 × 200
 
         @test size(gradient(stencils, f)) == (3, 200)
@@ -205,6 +204,63 @@ interior(points, margin) = [i for i in axes(points, 2) if all(margin .< points[:
             @test threaded_build.neighbours == serial_build.neighbours     # identical neighbour lists
             @test threaded_build.weights == serial_build.weights           # bitwise identical weights
         end
+    end
+
+    @testset "Regular grids and degenerate points" begin
+        # A regular grid of n points per axis in the unit cube, one column per point
+        grid(n, N) = reduce(hcat, [collect(Float64.(Tuple(c) .- 1) ./ (n - 1))
+                                   for c in CartesianIndices(ntuple(_ -> n, N))])
+
+        # Stencils on a regular grid are exact for linear fields everywhere, faces included,
+        # and the Laplacian is exact for quadratic ones, at both orders with the default k. On a
+        # 3D grid the nearest neighbours of face, edge and corner points lie on too few planes,
+        # so those stencils grow beyond k, up to the default kmax = 2k; inner points keep k
+        for (N, order) in [(2, 1), (2, 2), (3, 1), (3, 2)]
+            points = grid(15, N)
+            stencils = StencilSet(points; order)
+            k = 2 * minimum_neighbours(N, order)                           # the default stencil size
+            sizes = length.(stencils.neighbours)                           # neighbours of every point
+            @test all(k .<= sizes .<= 2k)                                  # never fewer than k, never more than kmax
+            if N == 3
+                @test any(sizes .> k)                                      # some boundary stencils grew
+                centre = argmin(vec(sum(abs2, points .- 0.5; dims = 1)))   # the point at the centre
+                @test sizes[centre] == k                                   # inner stencils did not grow
+            end
+            slope = collect(1.0:N)                                         # gradient of the linear field
+            @test maximum(abs, gradient(stencils, vec(slope' * points)) .- slope) < 1e-9
+            @test maximum(abs, laplacian(stencils, vec(sum(abs2, points; dims = 1))) .- 2N) < 1e-9
+            if order == 2
+                # With the third-moment conditions met at every point, the gradient of a
+                # quadratic field is exact everywhere, on the faces, edges and corners too
+                square = vec(sum(abs2, points; dims = 1))                  # |x|², whose gradient is 2x
+                @test maximum(abs, gradient(stencils, square) .- 2 .* points) < 1e-9
+            end
+        end
+        @test_throws ArgumentError StencilSet(grid(15, 2); kmax = 10)      # kmax below the default k = 18
+
+        # Points that do not fill their space cannot satisfy the moment conditions, even with
+        # grown stencils, so building stencils on them raises an error instead of giving
+        # meaningless derivatives
+        plane = vcat(lcg_points(2, 500), zeros(1, 500))                   # a plane in 3D
+        tilted = [1.0 0.0; 0.0 1.0; 0.3 0.7] * lcg_points(2, 500)         # a tilted plane in 3D
+        sphere = reduce(hcat, [[sin(acos(2v - 1)) * cos(2π * u),           # points spread evenly
+                                sin(acos(2v - 1)) * sin(2π * u),           # over the unit sphere's
+                                2v - 1] for (u, v) in eachcol(lcg_points(2, 1000))])  # curved surface
+        angles = range(0, 6.2, length = 500)
+        circle = vcat(cos.(angles)', sin.(angles)')                        # a circle in 2D
+        line = vcat(collect(range(0, 1, length = 500))', zeros(1, 500))    # a line in 2D
+        for points in (plane, tilted, sphere, circle, line)
+            @test_throws ArgumentError StencilSet(points)
+            @test_throws ArgumentError StencilSet(points; threaded = false)  # the same error without threads
+        end
+
+        # The message names the point and the cause
+        err = try StencilSet(sphere) catch e; e end
+        @test err isa ArgumentError
+        @test occursin("point", err.msg) && occursin("moment conditions", err.msg)
+
+        @test_throws ArgumentError StencilSet(grid(15, 2); kmax = 10)      # kmax below the default k = 18
+        @test_throws ArgumentError StencilSet(grid(15, 3); order = 1, kmax = 18)  # kmax = k: no growth, so 3D grid faces fail
     end
 
     @testset "Agreement with ConvolutionInterpolations.jl" begin

@@ -9,7 +9,8 @@ For `order = 1`, the weights satisfy
 
     Σ_k a_k Δx_k = 0    and    Σ_k a_k Δx_k Δx_kᵀ = I,
 
-which needs `M ≥ N(N+3)/2` neighbours. For `order = 2`, they also satisfy
+which needs `M ≥ N(N+3)/2` neighbours. For `order = 2`, they also satisfy,
+where the neighbours allow it,
 
     Σ_k a_k Δx_k ⊗ Δx_k ⊗ Δx_k = 0,
 
@@ -20,15 +21,22 @@ conditions, the returned `a` has minimum norm.
 The conditions are linear in `a`, so they are solved directly as one small
 system. This gives the same weights as the original Gram-matrix formulation,
 `a = P ((G ∘ G) P)⁺ diag(G)`, because `G ∘ G` carries exactly the
-information of the second-moment equations. If the neighbours are
-degenerate, for example all coplanar in 3D, conditions that cannot be
-satisfied independently are dropped.
+information of the second-moment equations.
+
+Throws an `ArgumentError` if the neighbours cannot satisfy the first two
+conditions, which happens when they lie on a curve or surface, or on too few
+layers of a regular grid; the derivatives would then be meaningless. The
+third-moment conditions are not checked: where the neighbours cannot meet
+them, as on the faces of a regular grid, the stencil remains correct to first
+order.
 """
 function coefficients(dX::AbstractMatrix{T}, order::Integer = 1) where {T<:AbstractFloat}
     N, M = size(dX)                                  # dimension and number of neighbours
     a = Vector{T}(undef, M)                          # the weights to return
     workspace = _Workspace{T}(N, M, order)           # scratch arrays for a single call
-    return coefficients!(a, workspace, dX, order)
+    _, residual = coefficients!(a, workspace, dX, order)  # fills a; the independence is not needed here
+    _require_moments(residual)                       # the first two conditions must hold
+    return a
 end
 
 # Scratch arrays for computing the weights of one stencil, reusable across
@@ -44,8 +52,32 @@ function _Workspace{T}(N::Integer, M::Integer, order::Integer) where {T<:Abstrac
     return _Workspace{T}(Matrix{T}(undef, M, m), Vector{T}(undef, m), Vector{T}(undef, m))
 end
 
+# The largest violation of the first- and second-moment conditions accepted, in
+# the scaled units the conditions are solved in. Stencils of points that fill
+# the space satisfy them to about 1e-10 in Float64 and 1e-5 in Float32; stencils
+# whose neighbours lie on a curve or surface, or on too few layers of a grid,
+# miss them by 0.1 or more
+_max_residual(::Type{T}) where {T<:AbstractFloat} = max(T(1e-6), sqrt(eps(T)))
+
+# Throw if the weights violate the first- and second-moment conditions by more
+# than `_max_residual`. These conditions make the operators correct; the weights
+# cannot satisfy them when the neighbours don't span every direction, and the
+# solver then silently drops them. A NaN residual also throws
+function _require_moments(residual::T) where {T<:AbstractFloat}
+    residual <= _max_residual(T) || throw(ArgumentError(
+        "the neighbours cannot satisfy the moment conditions (residual $(round(residual; sigdigits = 2))); " *
+        "they may lie on a curve or surface, or too few of them span every direction: " *
+        "try a larger k, or give the points in coordinates of their own dimension"))
+    return nothing
+end
+
 # In-place version of `coefficients`: write the weights into `a`, using the
-# arrays of `workspace` as scratch space, so that nothing is allocated
+# arrays of `workspace` as scratch space, so that nothing is allocated. Returns
+# two numbers about this stencil and leaves it to the caller to act on them: the
+# independence of the moment conditions (see `_minimum_norm_solve!`), typically
+# 0.05 or more for a well-shaped stencil and zero when a condition had to be
+# dropped, and the largest violation of the first- and second-moment conditions
+# (see `_moment_residual`), which `_require_moments` checks
 function coefficients!(a::AbstractVector{T}, workspace::_Workspace{T},
                        dX::AbstractMatrix{T}, order::Integer) where {T<:AbstractFloat}
     order in (1, 2) || throw(ArgumentError("order must be 1 or 2, got $order"))
@@ -55,10 +87,40 @@ function coefficients!(a::AbstractVector{T}, workspace::_Workspace{T},
     h = maximum(norm, eachcol(dX))                   # stencil radius: the largest offset length
     h > 0 || throw(ArgumentError("all neighbours coincide with the central point"))
     _moment_system!(workspace, dX, h, order)         # fill At and b with the moment conditions
-    _minimum_norm_solve!(a, workspace)               # minimum-norm weights for the scaled offsets
+    independence = _minimum_norm_solve!(a, workspace)  # minimum-norm weights for the scaled offsets
+    residual = _moment_residual(dX, a, h)            # violation of the conditions that make the operators correct
     a ./= h^2                                        # undo the scaling, since Σ a_k Δx_k Δx_kᵀ = I makes a ∝ 1/h²
-    return a
+    return independence, residual
 end
+
+# The largest violation of the first- and second-moment conditions by the
+# weights `a`, in scaled units (offsets divided by h, weights not yet divided by
+# h²). These two conditions make the operators correct; the third-moment
+# conditions of order 2 only raise their accuracy, and are left out, since
+# stencils on the faces of a regular grid cannot meet them yet remain correct to
+# first order. A NaN anywhere makes the result NaN.
+function _moment_residual(dX::AbstractMatrix{T}, a::AbstractVector{T}, h::T) where {T<:AbstractFloat}
+    N, M = size(dX)                                  # dimension and number of neighbours
+    worst = zero(T)                                  # the largest violation so far
+    for i in 1:N                                     # Σ a_k S_ik = 0
+        moment = zero(T)
+        for k in 1:M
+            moment += a[k] * (dX[i, k] / h)
+        end
+        worst = _larger_violation(worst, abs(moment))
+    end
+    for i in 1:N, j in i:N                           # Σ a_k S_ik S_jk = δ_ij
+        moment = zero(T)
+        for k in 1:M
+            moment += a[k] * (dX[i, k] / h) * (dX[j, k] / h)
+        end
+        worst = _larger_violation(worst, abs(moment - (i == j ? one(T) : zero(T))))
+    end
+    return worst
+end
+
+# The larger of two violations; once a NaN appears it stays, since every comparison with it is false
+_larger_violation(worst, violation) = (isnan(violation) || violation > worst) ? violation : worst
 
 # The moment conditions as a linear system, stored transposed for column access:
 # column r of At holds condition r evaluated at every neighbour, with the
@@ -101,11 +163,15 @@ end
 # orthogonality), while the right-hand side is forward-substituted alongside.
 # The solution is then a combination of the orthonormal columns. Conditions
 # that are linearly dependent on earlier ones leave a negligible remainder and
-# are dropped.
+# are dropped. Returns the independence of the conditions: the smallest
+# fraction of any condition left after removing its components along the
+# earlier ones. It is zero when a condition was dropped, and small when one is
+# nearly dependent, which makes the weights large.
 function _minimum_norm_solve!(a::AbstractVector{T}, workspace::_Workspace{T}) where {T<:AbstractFloat}
     At, b, y = workspace.At, workspace.b, workspace.y  # system and scratch coefficients
     M, m = size(At)                                  # neighbours and conditions
     tol = 100 * M * eps(T)                           # relative size below which a condition is dependent
+    independence = one(T)                            # smallest remaining fraction so far
     for r in 1:m
         t = b[r]                                     # right-hand side, reduced by earlier conditions
         original = norm(view(At, :, r))              # size of the condition before orthogonalization
@@ -122,6 +188,8 @@ function _minimum_norm_solve!(a::AbstractVector{T}, workspace::_Workspace{T}) wh
             end
         end
         remaining = norm(view(At, :, r))             # what is left of the condition
+        fraction = original > 0 ? remaining / original : zero(T)  # its independent fraction
+        independence = min(independence, fraction)
         if remaining <= tol * original
             At[:, r] .= zero(T)                      # dependent condition: drop it
             y[r] = zero(T)
@@ -136,5 +204,5 @@ function _minimum_norm_solve!(a::AbstractVector{T}, workspace::_Workspace{T}) wh
     for r in 1:m, k in 1:M
         a[k] += At[k, r] * y[r]
     end
-    return a
+    return independence
 end

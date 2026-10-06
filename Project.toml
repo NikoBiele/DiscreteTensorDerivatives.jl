@@ -1,6 +1,6 @@
 name = "DiscreteTensorDerivatives"
 uuid = "7583d466-fd83-4f69-8fbe-5e234170999e"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Nikolaj Maack Bielefeld"]
 
 [deps]

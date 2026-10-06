@@ -121,8 +121,14 @@ These $N(N+1)(N+2)/6$ equations are added to the same linear system, and they ma
 | `order = 1` | linear fields | quadratic fields | first order | 5 / 9 | 10 / 18 |
 | `order = 2` (default) | quadratic fields | cubic fields | second order | 9 / 19 | 18 / 38 |
 
-The default number of neighbours `k` is twice the minimum, because stencils at the minimum size are ill-conditioned. Set it explicitly with `StencilSet(points; k = 30)`, and use `minimum_neighbours(N, order)` to find the lower bound. Accuracy is lower near the boundary of the point cloud, where stencils are one-sided.
+The default number of neighbours `k` is twice the minimum, because stencils at the minimum size are ill-conditioned. Set it explicitly with `StencilSet(points; k = 30)`, and use `minimum_neighbours(N, order)` to find the lower bound. Where a point's `k` nearest neighbours cannot meet all moment conditions, as on the faces, edges and corners of a regular grid, its stencil grows one neighbour at a time, up to `kmax` neighbours (by default `2k`). Accuracy is lower near the boundary of the point cloud, where stencils are one-sided.
+
+The points must fill their space: points on a curve or surface, such as a plane or sphere in 3D, cannot satisfy the moment conditions even with grown stencils, and `StencilSet` throws an error naming the first point that fails.
 
 ## Acknowledgements
 
 This method descends from a 2016 Stack Overflow answer by a user named Hans, which introduced the moment conditions and the four operators above. That answer computed the weights through the Gram matrix $\mathbf{G} = \mathbf{B}^\mathsf{T}\mathbf{B}$ of the offset matrix $\mathbf{B}$, as $\mathbf{a} = \mathbf{P}\, \big( (\mathbf{G} \circ \mathbf{G})\, \mathbf{P} \big)^+ \mathrm{diag}(\mathbf{G})$, where $\mathbf{P}$ projects onto the null space of $\mathbf{B}$. This formula gives exactly the same weights as the minimum-norm solution above, because $\mathbf{G} \circ \mathbf{G}$ carries the same information as the second-moment equations. This package solves the moment equations directly, which is simpler and faster, and adds the second-order extension.
+
+## Declaration of AI Assistance
+
+DiscreteTensorDerivatives.jl was developed with assistance from Claude (Anthropic). The author found the method, worked through its derivations and directed the design of the package, while Claude helped turn the early prototype into a package and contributed to parts of the code, the tests and the documentation. The author has reviewed and is responsible for all code. The package is validated by its test suite, which checks the moment conditions, exactness on polynomial fields, the convergence order and agreement with [ConvolutionInterpolations.jl](https://github.com/NikoBiele/ConvolutionInterpolations.jl), and by its Python port [tensorderiv](https://github.com/NikoBiele/tensorderiv), which is tested against it.
